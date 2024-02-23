@@ -25,7 +25,9 @@ def pipe(*functions):
     
 
 def chain_functions(*functions):
-    """Example usage:
+    """
+    Chaining functions together using the pipe() function
+    Example usage:
     def add1(x, message=None):
     if message :
         print('Message: ', message)
