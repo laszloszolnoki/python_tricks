@@ -9,13 +9,14 @@ def pipe(*functions):
     return 1 + x
 
     result = pipe(
-    1,
-    add1,
-    add1,
-    add1,
+        1,
+        add1,
+        lambda x: add1(x, message='Hello'),
+        add1,
     )
+    #Output: Hello
     print(result)
-    #Output: 4    
+    #Output: 4
     """
     return reduce(
         lambda x, f: f(x) if not isinstance(x, list) else f(*x),
