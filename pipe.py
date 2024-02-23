@@ -4,9 +4,9 @@ def pipe(*functions):
     """Allows 'chaining' (or 'piping') functions together à la Elixir or Clojure.
     Example usage:
     def add1(x, message=None):
-    if message :
-        print('Message: ', message)
-    return 1 + x
+        if message :
+            print('Message: ', message)
+        return 1 + x
 
     result = pipe(
         1,
