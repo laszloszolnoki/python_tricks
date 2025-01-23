@@ -4,6 +4,7 @@ from functools import wraps
 import os
 import sys
 import traceback
+import ast
 #from multiprocessing import Process, Queue
 
 # added run_in_subprocess() on 2025-JAN-21
@@ -155,13 +156,15 @@ def threadify(max_workers=4):
         return wrapper
     return decorator
 
-def run_in_subprocess(timeout=60*60*10):
+def run_in_subprocess_simple(timeout=60*60*10):
     """
     Author: sl044
     version: 1.0
     Issue date: 2025-JAN-21
     Decorator that runs the decorated function in a subprocess with a timeout.
     Returns ('OK'|'ERROR', {'log': [log], 'result': [result]})
+    
+    !!! IMPORTANT !!! Referencing anything that is outside of the decorated function's scope DOES NOT WORK!
     
     # Example usage:
     @run_in_subprocess(timeout=6)
@@ -253,6 +256,177 @@ with open(r'{temp_output_filename}', 'wb') as f:
                 result['output'] = {'log': str(e), 'result': None}
             finally:
                 # Clean up the temporary files
+                os.remove(temp_filename)
+                if os.path.exists(temp_output_filename):
+                    os.remove(temp_output_filename)
+
+            return result['status'], result['output']
+        return wrapper
+    return decorator
+
+class NameCollector(ast.NodeVisitor):
+    """Helper class to collect all names referenced in the function and its dependencies"""
+    def __init__(self):
+        self.names = set()
+        self.functions = set()
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load):
+            self.names.add(node.id)
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        if isinstance(node.func, ast.Name):
+            self.functions.add(node.func.id)
+        self.generic_visit(node)
+
+def run_in_subprocess(timeout=60*60*10):
+    """
+    Author: sl044
+    version: 2.0
+    Issue date: 2025-JAN-23
+    Decorator that runs the decorated function in a subprocess with a timeout.
+    Returns ('OK'|'ERROR', {'log': [log], 'result': [result]})
+    
+    Supports referencing external variables and functions.
+    Dependency: pip install dill
+    """
+    import subprocess
+    import inspect
+    import tempfile
+    import os
+    import sys
+    from functools import wraps
+    import dill
+    
+    def get_function_dependencies(func, module_globals):
+        """Recursively collect all dependencies of a function"""
+        seen_funcs = set()
+        all_names = set()
+        
+        def collect_deps(f):
+            if f.__name__ in seen_funcs:
+                return
+            seen_funcs.add(f.__name__)
+            
+            # Get function source and parse AST
+            try:
+                func_code = inspect.getsource(f)
+                func_ast = compile(func_code, '<string>', 'exec', ast.PyCF_ONLY_AST)
+                name_visitor = NameCollector()
+                name_visitor.visit(func_ast)
+                
+                # Add all referenced names
+                all_names.update(name_visitor.names)
+                
+                # Recursively process referenced functions
+                for func_name in name_visitor.functions:
+                    if func_name in module_globals and callable(module_globals[func_name]):
+                        collect_deps(module_globals[func_name])
+                        
+            except (TypeError, OSError):
+                # Handle built-ins and other non-source-accessible functions
+                pass
+            
+            # Add closure variables
+            closure_vars = inspect.getclosurevars(f)
+            all_names.update(closure_vars.nonlocals.keys())
+            all_names.update(closure_vars.globals.keys())
+            
+        collect_deps(func)
+        return all_names
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Get the module globals
+            module_globals = sys.modules[func.__module__].__dict__
+            
+            # Get all dependencies recursively
+            referenced_names = get_function_dependencies(func, module_globals)
+            
+            # Create a dictionary of referenced globals
+            referenced_globals = {}
+            for name in referenced_names:
+                if name in module_globals:
+                    referenced_globals[name] = module_globals[name]
+            
+            # Get the function definition
+            func_code = inspect.getsource(func)
+            func_lines = func_code.splitlines()
+            if func_lines[0].strip().startswith('@'):
+                func_code = '\n'.join(func_lines[1:])
+            
+            func_name = func.__name__
+
+            # Serialize everything needed
+            serialized_data = dill.dumps({
+                'args': args,
+                'kwargs': kwargs,
+                'globals': referenced_globals
+            })
+
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.py') as temp_file:
+                temp_filename = temp_file.name
+                temp_output_filename = f"{temp_filename}.out"
+                temp_file.write(f"""
+import dill
+import sys
+import io
+import os
+import ast
+
+# Add the current directory to the PYTHONPATH
+current_dir = r'{os.getcwd()}'
+sys.path.append(current_dir)
+
+# Redirect stdout
+stdout = io.StringIO()
+sys.stdout = stdout
+
+# Load the serialized data
+data = dill.loads({serialized_data})
+
+# Update globals with the captured external references
+globals().update(data['globals'])
+
+{func_code}
+output = {func_name}(*data['args'], **data['kwargs'])
+
+# Write the output
+with open(r'{temp_output_filename}', 'wb') as f:
+    dill.dump((stdout.getvalue(), output), f)
+""")
+
+            result = {'status': 'OK', 'output': None}
+
+            try:
+                process = subprocess.Popen(
+                    [sys.executable, temp_filename],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True,
+                    env={**os.environ, 'PYTHONPATH': os.getcwd()}
+                )
+
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout)
+                    if process.returncode != 0:
+                        result['status'] = 'ERROR'
+                        result['output'] = {'log': stderr, 'result': None}
+                    else:
+                        with open(temp_output_filename, 'rb') as f:
+                            captured_stdout, function_output = dill.load(f)
+                        result['output'] = {'log': captured_stdout.strip(), 'result': function_output}
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    result['status'] = 'ERROR'
+                    result['output'] = {'log': 'timeout', 'result': None}
+            except Exception as e:
+                result['status'] = 'ERROR'
+                result['output'] = {'log': str(e), 'result': None}
+            finally:
                 os.remove(temp_filename)
                 if os.path.exists(temp_output_filename):
                     os.remove(temp_output_filename)
