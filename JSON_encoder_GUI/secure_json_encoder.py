@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Any, Dict, Union
 import hmac
 import os
-from PIL import Image  # Part of standard library since Python 3.9
 import io
 import tempfile
+import shutil
 
 class SecureJsonEncoder:
     """Secure JSON encoder/decoder with password or GIF-based encryption.
@@ -95,14 +95,16 @@ class SecureJsonEncoder:
     @staticmethod
     def _get_image_hash(image_path: str) -> str:
         """Convert GIF image to a base64 string to use as password."""
-        with Image.open(image_path) as img:
-            if img.format != 'GIF':
+        with open(image_path, 'rb') as f:
+            # Read first few bytes to verify GIF signature
+            header = f.read(6)
+            if header not in (b'GIF87a', b'GIF89a'):
                 raise ValueError("Only GIF images are supported")
             
-            # Convert to bytes and then to base64 string
-            img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='GIF', optimize=False)
-            return base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+            # Read entire file and convert to base64
+            f.seek(0)
+            image_data = f.read()
+            return base64.b64encode(image_data).decode('utf-8')
     
     @staticmethod
     def encrypt_json(
@@ -272,4 +274,4 @@ class SecureJsonEncoder:
             unpadded_data = decrypted_data[:-pad_length]
             
             # Parse JSON
-            return json.loads(bytes(unpadded_data).decode('utf-8')) 
+            return json.loads(bytes(unpadded_data).decode('utf-8'))
